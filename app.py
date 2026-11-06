@@ -5,6 +5,9 @@ from datetime import date, timedelta
 
 from flask import Flask, jsonify, request
 
+import config
+from rules import fine_for_days, loan_limit, default_due_date, renewed_due_date
+
 app = Flask(__name__)
 
 CURRENT_MEMBER = None
@@ -224,7 +227,7 @@ def member_loans(member_id):
             open_loans += 1
             days_late = (date.today() - date.fromisoformat(loan[3])).days
             if days_late > 0:
-                owed += days_late * 0.5
+                owed += fine_for_days(days_late)
         elif loan[6] == 0:
             owed += loan[5]
         loans.append(
@@ -237,10 +240,7 @@ def member_loans(member_id):
                 "fine_paid": bool(loan[6]),
             }
         )
-    if m[3] == "staff":
-        remaining = 5 - open_loans
-    else:
-        remaining = 3 - open_loans
+    remaining = loan_limit(m[3]) - open_loans
     return jsonify({"loans": loans, "total_owed": money(owed), "loans_remaining": remaining})
 
 
@@ -257,7 +257,7 @@ def list_loans():
         current_fine = loan[5]
         days_late = (date.today() - date.fromisoformat(loan[3])).days
         if loan[4] == 0:
-            current_fine = max(0, days_late) * 0.50
+            current_fine = fine_for_days(days_late)
         if request.args.get("overdue") == "true" and (loan[4] == 1 or days_late <= 0):
             continue
         result.append(
@@ -287,7 +287,7 @@ def get_loan(loan_id):
     current_fine = loan[5]
     if loan[4] == 0:
         days_late = (date.today() - date.fromisoformat(loan[3])).days
-        current_fine = max(0, days_late) * 0.50
+        current_fine = fine_for_days(days_late)
     return jsonify(
         {
             "id": loan[0],
@@ -334,21 +334,19 @@ def create_loan():
             open_loans += 1
             days_late = (date.today() - date.fromisoformat(loan[3])).days
             if days_late > 0:
-                owed += days_late * 0.5
+                owed += fine_for_days(days_late)
         elif loan[6] == 0:
             owed += loan[5]
     if owed > 0:
         conn.close()
         return jsonify({"error": "member has unpaid fines"}), 409
-    limit = 3
-    if member[3] == "staff":
-        limit = 5
+    limit = loan_limit(member[3])
     if open_loans >= limit:
         conn.close()
         return jsonify({"error": "loan limit reached"}), 409
 
     today = date.today()
-    due_date = data.get("due_date") or (today + timedelta(days=14)).isoformat()
+    due_date = data.get("due_date") or default_due_date(today)
     cur = conn.execute(
         "INSERT INTO loans (book_id, member_id, due_date, checked_out) VALUES (?, ?, ?, ?)",
         (data["book_id"], data["member_id"], due_date, today.isoformat()),
@@ -391,7 +389,7 @@ def return_book(loan_id):
         return jsonify({"error": "loan already returned"}), 409
 
     days_late = (date.today() - date.fromisoformat(loan[3])).days
-    fine = max(0, days_late) * 0.50
+    fine = fine_for_days(days_late)
     conn.execute("UPDATE loans SET returned = 1, fine = ? WHERE id = ?", (fine, loan_id))
     conn.execute("UPDATE books SET available = 1 WHERE id = ?", (loan[1],))
     conn.commit()
@@ -435,11 +433,11 @@ def renew_loan(loan_id):
     if date.fromisoformat(loan[3]) < date.today():
         conn.close()
         return jsonify({"error": "overdue loans cannot be renewed"}), 409
-    if loan[7] >= 1:
+    if loan[7] >= config.MAX_RENEWALS:
         conn.close()
         return jsonify({"error": "loan was already renewed"}), 409
 
-    new_due = (date.fromisoformat(loan[3]) + timedelta(days=14)).isoformat()
+    new_due = renewed_due_date(loan[3])
     conn.execute("UPDATE loans SET due_date = ?, renewals = renewals + 1 WHERE id = ?", (new_due, loan_id))
     conn.commit()
     CURRENT_MEMBER = conn.execute("SELECT * FROM members WHERE id = ?", (loan[2],)).fetchone()
@@ -525,7 +523,7 @@ def report_overdue():
     for r in rows:
         days_late = (date.today() - date.fromisoformat(r[3])).days
         if days_late > 0:
-            fine = days_late * 0.5
+            fine = fine_for_days(days_late)
             total += fine
             items.append(
                 {"loan_id": r[0], "title": r[1], "member": r[2], "days_late": days_late, "fine": money(fine)}
@@ -545,7 +543,7 @@ def report_summary():
         if loan[4] == 0:
             on_loan += 1
             days_late = (date.today() - date.fromisoformat(loan[3])).days
-            outstanding += max(0, days_late) * 0.50
+            outstanding += fine_for_days(days_late)
         elif loan[6] == 0:
             outstanding += loan[5]
     return jsonify({"total_books": total_books, "on_loan": on_loan, "fines_outstanding": money(outstanding)})
