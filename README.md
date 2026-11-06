@@ -58,19 +58,27 @@ Your instructor will give you a new requirement. Implement it in your refactored
 ## Measure your work
 
 | Measure | Before | After |
-|---|---|---|
-| Tests passing | | |
-| Lines in the largest file | | |
-| Places where the fine rate appears | | |
-| Route handlers containing SQL | | |
+|---|---:|---:|
+| Tests passing | 53 | 53 |
+| Lines in the largest file | 555 (`app.py`) | 163 (`repository.py`) |
+| Places where the fine rate appears | 7 | 1 (`config.py`) |
+| Route handlers containing SQL | 16 | 0 |
 | Places edited for the change request | n/a | |
-| Can the fine rule be tested without HTTP or a database? | | |
+| Can the fine rule be tested without HTTP or a database? | No | Yes |
 
 ## Questions to answer
 
-1. Which module is the most cohesive? Describe its one job in a sentence.
-2. Which dependency did you remove, and what can now change independently because of that?
-3. What coupling remains, and why did you accept it?
+1. **Which module is the most cohesive? Describe its one job in a sentence.**
+
+   `rules.py` is the most cohesive module because its job is to contain the library's business rules, such as calculating fines, checking renewal eligibility, and applying loan limits.
+
+2. **Which dependency did you remove, and what can now change independently because of that?**
+
+   I removed the dependency between route handlers and SQL queries by moving database operations into `repository.py`. The routes and database implementation can now change independently, as long as the repository interface stays consistent.
+
+3. **What coupling remains, and why did you accept it?**
+
+   The route modules still depend on repository functions, and the repository depends on the database schema. I accepted this coupling because the API needs to access the database, and keeping database-specific code in the repository makes that dependency clear and localized.
 
 ## API reference
 
