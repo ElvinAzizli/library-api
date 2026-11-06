@@ -6,59 +6,11 @@ from datetime import date, timedelta
 from flask import Flask, jsonify, request
 
 import config
+import notifier
+from db import connect, init_db
 from rules import fine_for_days, loan_limit, default_due_date, renewed_due_date
 
 app = Flask(__name__)
-
-CURRENT_MEMBER = None
-
-
-def init_db():
-    conn = sqlite3.connect("library.db")
-    conn.executescript(
-        """
-        DROP TABLE IF EXISTS books;
-        DROP TABLE IF EXISTS members;
-        DROP TABLE IF EXISTS loans;
-        CREATE TABLE books (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT, author TEXT, isbn TEXT, available INTEGER DEFAULT 1
-        );
-        CREATE TABLE members (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT, email TEXT UNIQUE, type TEXT
-        );
-        CREATE TABLE loans (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            book_id INTEGER, member_id INTEGER, due_date TEXT,
-            returned INTEGER DEFAULT 0, fine REAL DEFAULT 0,
-            fine_paid INTEGER DEFAULT 0, renewals INTEGER DEFAULT 0,
-            checked_out TEXT
-        );
-        """
-    )
-    books = [
-        ("Clean Code", "Robert C. Martin", "9780132350884", 1),
-        ("The Pragmatic Programmer", "Andrew Hunt", "9780135957059", 1),
-        ("Design Patterns", "Erich Gamma", "9780201633610", 1),
-        ("Refactoring", "Martin Fowler", "9780134757599", 1),
-        ("Code Complete", "Steve McConnell", "9780735619678", 0),
-    ]
-    conn.executemany("INSERT INTO books (title, author, isbn, available) VALUES (?, ?, ?, ?)", books)
-    members = [
-        ("Sam Rivera", "sam@campus.edu", "student"),
-        ("Dr. Noor Aziz", "noor@campus.edu", "staff"),
-        ("Alex Chen", "alex@campus.edu", "student"),
-    ]
-    conn.executemany("INSERT INTO members (name, email, type) VALUES (?, ?, ?)", members)
-    today = date.today()
-    conn.execute(
-        "INSERT INTO loans (book_id, member_id, due_date, checked_out) VALUES (5, 3, ?, ?)",
-        ((today - timedelta(days=5)).isoformat(), (today - timedelta(days=19)).isoformat()),
-    )
-    conn.commit()
-    conn.close()
-
 
 # ---------- helpers ----------
 
@@ -84,28 +36,12 @@ def money(x):
     return round(float(x), 2)
 
 
-def notify(kind, title="", send=True):
-    if not send:
-        return
-    if kind == "checkout":
-        subject = "Book checked out"
-        body = "You checked out " + title
-    elif kind == "renew":
-        subject = "Loan renewed"
-        body = "You renewed " + title
-    else:
-        subject = "Library notice"
-        body = title
-    with open("outbox.txt", "a") as f:
-        f.write("TO: " + CURRENT_MEMBER[2] + " | SUBJECT: " + subject + " | BODY: " + body + "\n")
-
-
 # ---------- books ----------
 
 
 @app.route("/books", methods=["GET"])
 def list_books():
-    conn = sqlite3.connect("library.db")
+    conn = connect()
     if request.args.get("available") == "true":
         rows = conn.execute("SELECT * FROM books WHERE available = 1").fetchall()
     else:
@@ -119,7 +55,7 @@ def list_books():
 
 @app.route("/books/<int:book_id>", methods=["GET"])
 def get_book(book_id):
-    conn = sqlite3.connect("library.db")
+    conn = connect()
     r = conn.execute("SELECT * FROM books WHERE id = ?", (book_id,)).fetchone()
     conn.close()
     if r is None:
@@ -134,7 +70,7 @@ def create_book():
         return jsonify({"error": "title and author are required"}), 400
     if not check(data.get("isbn"), "isbn"):
         return jsonify({"error": "invalid isbn"}), 400
-    conn = sqlite3.connect("library.db")
+    conn = connect()
     cur = conn.execute(
         "INSERT INTO books (title, author, isbn, available) VALUES (?, ?, ?, 1)",
         (data["title"], data["author"], data["isbn"]),
@@ -147,7 +83,7 @@ def create_book():
 
 @app.route("/books/<int:book_id>", methods=["DELETE"])
 def delete_book(book_id):
-    conn = sqlite3.connect("library.db")
+    conn = connect()
     r = conn.execute("SELECT * FROM books WHERE id = ?", (book_id,)).fetchone()
     if r is None:
         conn.close()
@@ -166,7 +102,7 @@ def delete_book(book_id):
 
 @app.route("/members", methods=["GET"])
 def list_members():
-    conn = sqlite3.connect("library.db")
+    conn = connect()
     rows = conn.execute("SELECT * FROM members").fetchall()
     conn.close()
     result = []
@@ -177,7 +113,7 @@ def list_members():
 
 @app.route("/members/<int:member_id>", methods=["GET"])
 def get_member(member_id):
-    conn = sqlite3.connect("library.db")
+    conn = connect()
     r = conn.execute("SELECT * FROM members WHERE id = ?", (member_id,)).fetchone()
     conn.close()
     if r is None:
@@ -195,7 +131,7 @@ def create_member():
     member_type = data.get("type", "student")
     if not check(member_type, "member_type"):
         return jsonify({"error": "type must be student or staff"}), 400
-    conn = sqlite3.connect("library.db")
+    conn = connect()
     existing = conn.execute("SELECT * FROM members WHERE email = ?", (data["email"],)).fetchone()
     if existing is not None:
         conn.close()
@@ -212,7 +148,7 @@ def create_member():
 
 @app.route("/members/<int:member_id>/loans", methods=["GET"])
 def member_loans(member_id):
-    conn = sqlite3.connect("library.db")
+    conn = connect()
     m = conn.execute("SELECT * FROM members WHERE id = ?", (member_id,)).fetchone()
     if m is None:
         conn.close()
@@ -249,7 +185,7 @@ def member_loans(member_id):
 
 @app.route("/loans", methods=["GET"])
 def list_loans():
-    conn = sqlite3.connect("library.db")
+    conn = connect()
     rows = conn.execute("SELECT * FROM loans").fetchall()
     conn.close()
     result = []
@@ -279,7 +215,7 @@ def list_loans():
 
 @app.route("/loans/<int:loan_id>", methods=["GET"])
 def get_loan(loan_id):
-    conn = sqlite3.connect("library.db")
+    conn = connect()
     loan = conn.execute("SELECT * FROM loans WHERE id = ?", (loan_id,)).fetchone()
     conn.close()
     if loan is None:
@@ -306,14 +242,13 @@ def get_loan(loan_id):
 
 @app.route("/loans", methods=["POST"])
 def create_loan():
-    global CURRENT_MEMBER
     data = request.get_json(silent=True) or {}
     if not data.get("book_id") or not data.get("member_id"):
         return jsonify({"error": "book_id and member_id are required"}), 400
     if data.get("due_date") and not check(data["due_date"], "date"):
         return jsonify({"error": "invalid due_date"}), 400
 
-    conn = sqlite3.connect("library.db")
+    conn = connect()
     book = conn.execute("SELECT * FROM books WHERE id = ?", (data["book_id"],)).fetchone()
     if book is None:
         conn.close()
@@ -356,8 +291,7 @@ def create_loan():
     loan = conn.execute("SELECT * FROM loans WHERE id = ?", (cur.lastrowid,)).fetchone()
     conn.close()
 
-    CURRENT_MEMBER = member
-    notify("checkout", book[1])
+    notifier.checkout(member[2], book[1])
 
     return (
         jsonify(
@@ -379,7 +313,7 @@ def create_loan():
 
 @app.route("/loans/<int:loan_id>/return", methods=["POST"])
 def return_book(loan_id):
-    conn = sqlite3.connect("library.db")
+    conn = connect()
     loan = conn.execute("SELECT * FROM loans WHERE id = ?", (loan_id,)).fetchone()
     if loan is None:
         conn.close()
@@ -398,11 +332,7 @@ def return_book(loan_id):
     updated = conn.execute("SELECT * FROM loans WHERE id = ?", (loan_id,)).fetchone()
     conn.close()
 
-    with open("outbox.txt", "a") as f:
-        f.write(
-            "TO: " + member[2] + " | SUBJECT: Book returned | BODY: You returned " + book[1]
-            + ". Fine: $" + str(money(fine)) + "\n"
-        )
+    notifier.returned(member[2], book[1], fine)
 
     return jsonify(
         {
@@ -421,8 +351,7 @@ def return_book(loan_id):
 
 @app.route("/loans/<int:loan_id>/renew", methods=["POST"])
 def renew_loan(loan_id):
-    global CURRENT_MEMBER
-    conn = sqlite3.connect("library.db")
+    conn = connect()
     loan = conn.execute("SELECT * FROM loans WHERE id = ?", (loan_id,)).fetchone()
     if loan is None:
         conn.close()
@@ -440,12 +369,12 @@ def renew_loan(loan_id):
     new_due = renewed_due_date(loan[3])
     conn.execute("UPDATE loans SET due_date = ?, renewals = renewals + 1 WHERE id = ?", (new_due, loan_id))
     conn.commit()
-    CURRENT_MEMBER = conn.execute("SELECT * FROM members WHERE id = ?", (loan[2],)).fetchone()
+    member = conn.execute("SELECT * FROM members WHERE id = ?", (loan[2],)).fetchone()
     book = conn.execute("SELECT * FROM books WHERE id = ?", (loan[1],)).fetchone()
     updated = conn.execute("SELECT * FROM loans WHERE id = ?", (loan_id,)).fetchone()
     conn.close()
 
-    notify("renew", book[1])
+    notifier.renewed(member[2], book[1])
 
     return jsonify(
         {
@@ -464,7 +393,7 @@ def renew_loan(loan_id):
 
 @app.route("/loans/<int:loan_id>/pay-fine", methods=["POST"])
 def pay_fine(loan_id):
-    conn = sqlite3.connect("library.db")
+    conn = connect()
     loan = conn.execute("SELECT * FROM loans WHERE id = ?", (loan_id,)).fetchone()
     if loan is None:
         conn.close()
@@ -482,10 +411,7 @@ def pay_fine(loan_id):
     updated = conn.execute("SELECT * FROM loans WHERE id = ?", (loan_id,)).fetchone()
     conn.close()
 
-    with open("outbox.txt", "a") as f:
-        f.write(
-            "TO: " + member[2] + " | SUBJECT: Fine paid | BODY: We received $" + str(money(loan[5])) + "\n"
-        )
+    notifier.fine_paid(member[2], loan[5])
 
     return jsonify(
         {
@@ -507,7 +433,7 @@ def pay_fine(loan_id):
 
 @app.route("/reports/overdue", methods=["GET"])
 def report_overdue():
-    conn = sqlite3.connect("library.db")
+    conn = connect()
     rows = conn.execute(
         """
         SELECT loans.id, books.title, members.name, loans.due_date
@@ -533,7 +459,7 @@ def report_overdue():
 
 @app.route("/reports/summary", methods=["GET"])
 def report_summary():
-    conn = sqlite3.connect("library.db")
+    conn = connect()
     total_books = conn.execute("SELECT COUNT(*) FROM books").fetchone()[0]
     rows = conn.execute("SELECT * FROM loans").fetchall()
     conn.close()
@@ -549,5 +475,5 @@ def report_summary():
     return jsonify({"total_books": total_books, "on_loan": on_loan, "fines_outstanding": money(outstanding)})
 
 
-if not os.path.exists("library.db"):
+if not os.path.exists(config.DB_PATH):
     init_db()
