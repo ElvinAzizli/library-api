@@ -27,3 +27,21 @@ def default_due_date(today=None):
 
 def renewed_due_date(due_date):
     return (date.fromisoformat(due_date) + timedelta(days=config.RENEWAL_DAYS)).isoformat()
+
+
+def today_iso():
+    return date.today().isoformat()
+
+
+def open_loan_count(loans):
+    return sum(1 for loan in loans if not loan["returned"])
+
+
+def amount_owed(loans, today=None):
+    owed = 0
+    for loan in loans:
+        if not loan["returned"]:
+            owed += fine_for_due_date(loan["due_date"], today)
+        elif not loan["fine_paid"]:
+            owed += loan["fine"]
+    return owed

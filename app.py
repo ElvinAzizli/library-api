@@ -1,39 +1,16 @@
 import os
-import re
-import sqlite3
-from datetime import date, timedelta
 
 from flask import Flask, jsonify, request
 
 import config
 import notifier
-from db import connect, init_db
-from rules import fine_for_days, loan_limit, default_due_date, renewed_due_date
+import repository as repo
+import rules
+from db import init_db  # re-exported: the tests and the startup check use it from app
+from serializers import book_json, member_json, loan_json, loan_json_with_fine, loan_summary_json, money
+from validation import check
 
 app = Flask(__name__)
-
-# ---------- helpers ----------
-
-
-def check(value, kind):
-    if kind == "email":
-        return re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", str(value)) is not None
-    elif kind == "isbn":
-        digits = str(value).replace("-", "")
-        return digits.isdigit() and len(digits) in (10, 13)
-    elif kind == "date":
-        try:
-            date.fromisoformat(str(value))
-            return True
-        except ValueError:
-            return False
-    elif kind == "member_type":
-        return value in ("student", "staff")
-    return False
-
-
-def money(x):
-    return round(float(x), 2)
 
 
 # ---------- books ----------
@@ -41,26 +18,16 @@ def money(x):
 
 @app.route("/books", methods=["GET"])
 def list_books():
-    conn = connect()
-    if request.args.get("available") == "true":
-        rows = conn.execute("SELECT * FROM books WHERE available = 1").fetchall()
-    else:
-        rows = conn.execute("SELECT * FROM books").fetchall()
-    conn.close()
-    result = []
-    for r in rows:
-        result.append({"id": r[0], "title": r[1], "author": r[2], "isbn": r[3], "available": bool(r[4])})
-    return jsonify(result)
+    books = repo.list_books(available_only=request.args.get("available") == "true")
+    return jsonify([book_json(b) for b in books])
 
 
 @app.route("/books/<int:book_id>", methods=["GET"])
 def get_book(book_id):
-    conn = connect()
-    r = conn.execute("SELECT * FROM books WHERE id = ?", (book_id,)).fetchone()
-    conn.close()
-    if r is None:
+    book = repo.get_book(book_id)
+    if book is None:
         return jsonify({"error": "book not found"}), 404
-    return jsonify({"id": r[0], "title": r[1], "author": r[2], "isbn": r[3], "available": bool(r[4])})
+    return jsonify(book_json(book))
 
 
 @app.route("/books", methods=["POST"])
@@ -70,30 +37,18 @@ def create_book():
         return jsonify({"error": "title and author are required"}), 400
     if not check(data.get("isbn"), "isbn"):
         return jsonify({"error": "invalid isbn"}), 400
-    conn = connect()
-    cur = conn.execute(
-        "INSERT INTO books (title, author, isbn, available) VALUES (?, ?, ?, 1)",
-        (data["title"], data["author"], data["isbn"]),
-    )
-    conn.commit()
-    r = conn.execute("SELECT * FROM books WHERE id = ?", (cur.lastrowid,)).fetchone()
-    conn.close()
-    return jsonify({"id": r[0], "title": r[1], "author": r[2], "isbn": r[3], "available": bool(r[4])}), 201
+    book = repo.add_book(data["title"], data["author"], data["isbn"])
+    return jsonify(book_json(book)), 201
 
 
 @app.route("/books/<int:book_id>", methods=["DELETE"])
 def delete_book(book_id):
-    conn = connect()
-    r = conn.execute("SELECT * FROM books WHERE id = ?", (book_id,)).fetchone()
-    if r is None:
-        conn.close()
+    book = repo.get_book(book_id)
+    if book is None:
         return jsonify({"error": "book not found"}), 404
-    if r[4] == 0:
-        conn.close()
+    if book["available"] == 0:
         return jsonify({"error": "book is on loan"}), 409
-    conn.execute("DELETE FROM books WHERE id = ?", (book_id,))
-    conn.commit()
-    conn.close()
+    repo.delete_book(book_id)
     return "", 204
 
 
@@ -102,23 +57,15 @@ def delete_book(book_id):
 
 @app.route("/members", methods=["GET"])
 def list_members():
-    conn = connect()
-    rows = conn.execute("SELECT * FROM members").fetchall()
-    conn.close()
-    result = []
-    for r in rows:
-        result.append({"id": r[0], "name": r[1], "email": r[2], "type": r[3]})
-    return jsonify(result)
+    return jsonify([member_json(m) for m in repo.list_members()])
 
 
 @app.route("/members/<int:member_id>", methods=["GET"])
 def get_member(member_id):
-    conn = connect()
-    r = conn.execute("SELECT * FROM members WHERE id = ?", (member_id,)).fetchone()
-    conn.close()
-    if r is None:
+    member = repo.get_member(member_id)
+    if member is None:
         return jsonify({"error": "member not found"}), 404
-    return jsonify({"id": r[0], "name": r[1], "email": r[2], "type": r[3]})
+    return jsonify(member_json(member))
 
 
 @app.route("/members", methods=["POST"])
@@ -131,53 +78,26 @@ def create_member():
     member_type = data.get("type", "student")
     if not check(member_type, "member_type"):
         return jsonify({"error": "type must be student or staff"}), 400
-    conn = connect()
-    existing = conn.execute("SELECT * FROM members WHERE email = ?", (data["email"],)).fetchone()
-    if existing is not None:
-        conn.close()
+    if repo.get_member_by_email(data["email"]) is not None:
         return jsonify({"error": "email already registered"}), 409
-    cur = conn.execute(
-        "INSERT INTO members (name, email, type) VALUES (?, ?, ?)",
-        (data["name"], data["email"], member_type),
-    )
-    conn.commit()
-    r = conn.execute("SELECT * FROM members WHERE id = ?", (cur.lastrowid,)).fetchone()
-    conn.close()
-    return jsonify({"id": r[0], "name": r[1], "email": r[2], "type": r[3]}), 201
+    member = repo.add_member(data["name"], data["email"], member_type)
+    return jsonify(member_json(member)), 201
 
 
 @app.route("/members/<int:member_id>/loans", methods=["GET"])
 def member_loans(member_id):
-    conn = connect()
-    m = conn.execute("SELECT * FROM members WHERE id = ?", (member_id,)).fetchone()
-    if m is None:
-        conn.close()
+    member = repo.get_member(member_id)
+    if member is None:
         return jsonify({"error": "member not found"}), 404
-    rows = conn.execute("SELECT * FROM loans WHERE member_id = ?", (member_id,)).fetchall()
-    conn.close()
-    owed = 0
-    open_loans = 0
-    loans = []
-    for loan in rows:
-        if loan[4] == 0:
-            open_loans += 1
-            days_late = (date.today() - date.fromisoformat(loan[3])).days
-            if days_late > 0:
-                owed += fine_for_days(days_late)
-        elif loan[6] == 0:
-            owed += loan[5]
-        loans.append(
-            {
-                "id": loan[0],
-                "book_id": loan[1],
-                "due_date": loan[3],
-                "returned": bool(loan[4]),
-                "fine": money(loan[5]),
-                "fine_paid": bool(loan[6]),
-            }
-        )
-    remaining = loan_limit(m[3]) - open_loans
-    return jsonify({"loans": loans, "total_owed": money(owed), "loans_remaining": remaining})
+    loans = repo.loans_for_member(member_id)
+    remaining = rules.loan_limit(member["type"]) - rules.open_loan_count(loans)
+    return jsonify(
+        {
+            "loans": [loan_summary_json(loan) for loan in loans],
+            "total_owed": money(rules.amount_owed(loans)),
+            "loans_remaining": remaining,
+        }
+    )
 
 
 # ---------- loans ----------
@@ -185,59 +105,21 @@ def member_loans(member_id):
 
 @app.route("/loans", methods=["GET"])
 def list_loans():
-    conn = connect()
-    rows = conn.execute("SELECT * FROM loans").fetchall()
-    conn.close()
+    overdue_only = request.args.get("overdue") == "true"
     result = []
-    for loan in rows:
-        current_fine = loan[5]
-        days_late = (date.today() - date.fromisoformat(loan[3])).days
-        if loan[4] == 0:
-            current_fine = fine_for_days(days_late)
-        if request.args.get("overdue") == "true" and (loan[4] == 1 or days_late <= 0):
+    for loan in repo.list_loans():
+        if overdue_only and (loan["returned"] == 1 or rules.days_late(loan["due_date"]) <= 0):
             continue
-        result.append(
-            {
-                "id": loan[0],
-                "book_id": loan[1],
-                "member_id": loan[2],
-                "due_date": loan[3],
-                "returned": bool(loan[4]),
-                "fine": money(loan[5]),
-                "fine_paid": bool(loan[6]),
-                "renewals": loan[7],
-                "checked_out": loan[8],
-                "current_fine": money(current_fine),
-            }
-        )
+        result.append(loan_json_with_fine(loan))
     return jsonify(result)
 
 
 @app.route("/loans/<int:loan_id>", methods=["GET"])
 def get_loan(loan_id):
-    conn = connect()
-    loan = conn.execute("SELECT * FROM loans WHERE id = ?", (loan_id,)).fetchone()
-    conn.close()
+    loan = repo.get_loan(loan_id)
     if loan is None:
         return jsonify({"error": "loan not found"}), 404
-    current_fine = loan[5]
-    if loan[4] == 0:
-        days_late = (date.today() - date.fromisoformat(loan[3])).days
-        current_fine = fine_for_days(days_late)
-    return jsonify(
-        {
-            "id": loan[0],
-            "book_id": loan[1],
-            "member_id": loan[2],
-            "due_date": loan[3],
-            "returned": bool(loan[4]),
-            "fine": money(loan[5]),
-            "fine_paid": bool(loan[6]),
-            "renewals": loan[7],
-            "checked_out": loan[8],
-            "current_fine": money(current_fine),
-        }
-    )
+    return jsonify(loan_json_with_fine(loan))
 
 
 @app.route("/loans", methods=["POST"])
@@ -248,184 +130,76 @@ def create_loan():
     if data.get("due_date") and not check(data["due_date"], "date"):
         return jsonify({"error": "invalid due_date"}), 400
 
-    conn = connect()
-    book = conn.execute("SELECT * FROM books WHERE id = ?", (data["book_id"],)).fetchone()
+    book = repo.get_book(data["book_id"])
     if book is None:
-        conn.close()
         return jsonify({"error": "book not found"}), 404
-    member = conn.execute("SELECT * FROM members WHERE id = ?", (data["member_id"],)).fetchone()
+    member = repo.get_member(data["member_id"])
     if member is None:
-        conn.close()
         return jsonify({"error": "member not found"}), 404
-    if book[4] == 0:
-        conn.close()
+    if book["available"] == 0:
         return jsonify({"error": "book is not available"}), 409
 
-    rows = conn.execute("SELECT * FROM loans WHERE member_id = ?", (data["member_id"],)).fetchall()
-    owed = 0
-    open_loans = 0
-    for loan in rows:
-        if loan[4] == 0:
-            open_loans += 1
-            days_late = (date.today() - date.fromisoformat(loan[3])).days
-            if days_late > 0:
-                owed += fine_for_days(days_late)
-        elif loan[6] == 0:
-            owed += loan[5]
-    if owed > 0:
-        conn.close()
+    loans = repo.loans_for_member(data["member_id"])
+    if rules.amount_owed(loans) > 0:
         return jsonify({"error": "member has unpaid fines"}), 409
-    limit = loan_limit(member[3])
-    if open_loans >= limit:
-        conn.close()
+    if rules.open_loan_count(loans) >= rules.loan_limit(member["type"]):
         return jsonify({"error": "loan limit reached"}), 409
 
-    today = date.today()
-    due_date = data.get("due_date") or default_due_date(today)
-    cur = conn.execute(
-        "INSERT INTO loans (book_id, member_id, due_date, checked_out) VALUES (?, ?, ?, ?)",
-        (data["book_id"], data["member_id"], due_date, today.isoformat()),
-    )
-    conn.execute("UPDATE books SET available = 0 WHERE id = ?", (data["book_id"],))
-    conn.commit()
-    loan = conn.execute("SELECT * FROM loans WHERE id = ?", (cur.lastrowid,)).fetchone()
-    conn.close()
-
-    notifier.checkout(member[2], book[1])
-
-    return (
-        jsonify(
-            {
-                "id": loan[0],
-                "book_id": loan[1],
-                "member_id": loan[2],
-                "due_date": loan[3],
-                "returned": bool(loan[4]),
-                "fine": money(loan[5]),
-                "fine_paid": bool(loan[6]),
-                "renewals": loan[7],
-                "checked_out": loan[8],
-            }
-        ),
-        201,
-    )
+    due_date = data.get("due_date") or rules.default_due_date()
+    loan = repo.create_loan(data["book_id"], data["member_id"], due_date, rules.today_iso())
+    notifier.checkout(member["email"], book["title"])
+    return jsonify(loan_json(loan)), 201
 
 
 @app.route("/loans/<int:loan_id>/return", methods=["POST"])
 def return_book(loan_id):
-    conn = connect()
-    loan = conn.execute("SELECT * FROM loans WHERE id = ?", (loan_id,)).fetchone()
+    loan = repo.get_loan(loan_id)
     if loan is None:
-        conn.close()
         return jsonify({"error": "loan not found"}), 404
-    if loan[4] == 1:
-        conn.close()
+    if loan["returned"] == 1:
         return jsonify({"error": "loan already returned"}), 409
 
-    days_late = (date.today() - date.fromisoformat(loan[3])).days
-    fine = fine_for_days(days_late)
-    conn.execute("UPDATE loans SET returned = 1, fine = ? WHERE id = ?", (fine, loan_id))
-    conn.execute("UPDATE books SET available = 1 WHERE id = ?", (loan[1],))
-    conn.commit()
-    member = conn.execute("SELECT * FROM members WHERE id = ?", (loan[2],)).fetchone()
-    book = conn.execute("SELECT * FROM books WHERE id = ?", (loan[1],)).fetchone()
-    updated = conn.execute("SELECT * FROM loans WHERE id = ?", (loan_id,)).fetchone()
-    conn.close()
-
-    notifier.returned(member[2], book[1], fine)
-
-    return jsonify(
-        {
-            "id": updated[0],
-            "book_id": updated[1],
-            "member_id": updated[2],
-            "due_date": updated[3],
-            "returned": bool(updated[4]),
-            "fine": money(updated[5]),
-            "fine_paid": bool(updated[6]),
-            "renewals": updated[7],
-            "checked_out": updated[8],
-        }
-    )
+    fine = rules.fine_for_due_date(loan["due_date"])
+    updated = repo.mark_returned(loan_id, loan["book_id"], fine)
+    member = repo.get_member(loan["member_id"])
+    book = repo.get_book(loan["book_id"])
+    notifier.returned(member["email"], book["title"], fine)
+    return jsonify(loan_json(updated))
 
 
 @app.route("/loans/<int:loan_id>/renew", methods=["POST"])
 def renew_loan(loan_id):
-    conn = connect()
-    loan = conn.execute("SELECT * FROM loans WHERE id = ?", (loan_id,)).fetchone()
+    loan = repo.get_loan(loan_id)
     if loan is None:
-        conn.close()
         return jsonify({"error": "loan not found"}), 404
-    if loan[4] == 1:
-        conn.close()
+    if loan["returned"] == 1:
         return jsonify({"error": "loan already returned"}), 409
-    if date.fromisoformat(loan[3]) < date.today():
-        conn.close()
+    if rules.days_late(loan["due_date"]) > 0:
         return jsonify({"error": "overdue loans cannot be renewed"}), 409
-    if loan[7] >= config.MAX_RENEWALS:
-        conn.close()
+    if loan["renewals"] >= config.MAX_RENEWALS:
         return jsonify({"error": "loan was already renewed"}), 409
 
-    new_due = renewed_due_date(loan[3])
-    conn.execute("UPDATE loans SET due_date = ?, renewals = renewals + 1 WHERE id = ?", (new_due, loan_id))
-    conn.commit()
-    member = conn.execute("SELECT * FROM members WHERE id = ?", (loan[2],)).fetchone()
-    book = conn.execute("SELECT * FROM books WHERE id = ?", (loan[1],)).fetchone()
-    updated = conn.execute("SELECT * FROM loans WHERE id = ?", (loan_id,)).fetchone()
-    conn.close()
-
-    notifier.renewed(member[2], book[1])
-
-    return jsonify(
-        {
-            "id": updated[0],
-            "book_id": updated[1],
-            "member_id": updated[2],
-            "due_date": updated[3],
-            "returned": bool(updated[4]),
-            "fine": money(updated[5]),
-            "fine_paid": bool(updated[6]),
-            "renewals": updated[7],
-            "checked_out": updated[8],
-        }
-    )
+    updated = repo.renew_loan(loan_id, rules.renewed_due_date(loan["due_date"]))
+    member = repo.get_member(loan["member_id"])
+    book = repo.get_book(loan["book_id"])
+    notifier.renewed(member["email"], book["title"])
+    return jsonify(loan_json(updated))
 
 
 @app.route("/loans/<int:loan_id>/pay-fine", methods=["POST"])
 def pay_fine(loan_id):
-    conn = connect()
-    loan = conn.execute("SELECT * FROM loans WHERE id = ?", (loan_id,)).fetchone()
+    loan = repo.get_loan(loan_id)
     if loan is None:
-        conn.close()
         return jsonify({"error": "loan not found"}), 404
-    if loan[4] == 0:
-        conn.close()
+    if loan["returned"] == 0:
         return jsonify({"error": "return the book before paying"}), 409
-    if loan[5] <= 0 or loan[6] == 1:
-        conn.close()
+    if loan["fine"] <= 0 or loan["fine_paid"] == 1:
         return jsonify({"error": "no fine to pay"}), 409
 
-    conn.execute("UPDATE loans SET fine_paid = 1 WHERE id = ?", (loan_id,))
-    conn.commit()
-    member = conn.execute("SELECT * FROM members WHERE id = ?", (loan[2],)).fetchone()
-    updated = conn.execute("SELECT * FROM loans WHERE id = ?", (loan_id,)).fetchone()
-    conn.close()
-
-    notifier.fine_paid(member[2], loan[5])
-
-    return jsonify(
-        {
-            "id": updated[0],
-            "book_id": updated[1],
-            "member_id": updated[2],
-            "due_date": updated[3],
-            "returned": bool(updated[4]),
-            "fine": money(updated[5]),
-            "fine_paid": bool(updated[6]),
-            "renewals": updated[7],
-            "checked_out": updated[8],
-        }
-    )
+    updated = repo.mark_fine_paid(loan_id)
+    member = repo.get_member(loan["member_id"])
+    notifier.fine_paid(member["email"], loan["fine"])
+    return jsonify(loan_json(updated))
 
 
 # ---------- reports ----------
@@ -433,46 +207,35 @@ def pay_fine(loan_id):
 
 @app.route("/reports/overdue", methods=["GET"])
 def report_overdue():
-    conn = connect()
-    rows = conn.execute(
-        """
-        SELECT loans.id, books.title, members.name, loans.due_date
-        FROM loans
-        JOIN books ON books.id = loans.book_id
-        JOIN members ON members.id = loans.member_id
-        WHERE loans.returned = 0
-        """
-    ).fetchall()
-    conn.close()
     items = []
     total = 0
-    for r in rows:
-        days_late = (date.today() - date.fromisoformat(r[3])).days
-        if days_late > 0:
-            fine = fine_for_days(days_late)
+    for row in repo.open_loans_with_details():
+        late = rules.days_late(row["due_date"])
+        if late > 0:
+            fine = rules.fine_for_days(late)
             total += fine
             items.append(
-                {"loan_id": r[0], "title": r[1], "member": r[2], "days_late": days_late, "fine": money(fine)}
+                {
+                    "loan_id": row["loan_id"],
+                    "title": row["title"],
+                    "member": row["member"],
+                    "days_late": late,
+                    "fine": money(fine),
+                }
             )
     return jsonify({"items": items, "total_fines": money(total)})
 
 
 @app.route("/reports/summary", methods=["GET"])
 def report_summary():
-    conn = connect()
-    total_books = conn.execute("SELECT COUNT(*) FROM books").fetchone()[0]
-    rows = conn.execute("SELECT * FROM loans").fetchall()
-    conn.close()
-    on_loan = 0
-    outstanding = 0
-    for loan in rows:
-        if loan[4] == 0:
-            on_loan += 1
-            days_late = (date.today() - date.fromisoformat(loan[3])).days
-            outstanding += fine_for_days(days_late)
-        elif loan[6] == 0:
-            outstanding += loan[5]
-    return jsonify({"total_books": total_books, "on_loan": on_loan, "fines_outstanding": money(outstanding)})
+    loans = repo.list_loans()
+    return jsonify(
+        {
+            "total_books": repo.count_books(),
+            "on_loan": rules.open_loan_count(loans),
+            "fines_outstanding": money(rules.amount_owed(loans)),
+        }
+    )
 
 
 if not os.path.exists(config.DB_PATH):
